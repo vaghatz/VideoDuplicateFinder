@@ -49,6 +49,28 @@ public class VideoDuplicateFinder extends JFrame {
     private static final double[] SAMPLE_FRACTIONS = {0.10, 0.30, 0.50, 0.70, 0.90};
     private static final File FOLDERS_FILE = new File("saved_folders.txt");
 
+    // --- Identification cache: avoids re-probing/re-hashing files that haven't changed ---
+    private static final Path CACHE_FILE = Paths.get(
+        System.getProperty("user.home"), ".videoduplicatefinder", "id_cache.tsv");
+    private static final Map<String, CacheEntry> fingerprintCache = new HashMap<>();
+
+    /** One cached record per file, keyed by absolute path. hashes is null until hash-verified. */
+    private static class CacheEntry {
+        final long size;
+        final long mtime;
+        final double duration;
+        final long[] hashes;
+        CacheEntry(long size, long mtime, double duration, long[] hashes) {
+            this.size = size;
+            this.mtime = mtime;
+            this.duration = duration;
+            this.hashes = hashes;
+        }
+        boolean matches(long size, long mtime) {
+            return this.size == size && this.mtime == mtime;
+        }
+    }
+
     public VideoDuplicateFinder() {
         super("Video Duplicate Finder");
         setDefaultCloseOperation(EXIT_ON_CLOSE);
@@ -96,6 +118,8 @@ public class VideoDuplicateFinder extends JFrame {
         folderPanel.add(new JScrollPane(folderList), BorderLayout.CENTER);
         folderPanel.add(folderButtons, BorderLayout.SOUTH);
 
+        JButton clearCacheButton = new JButton("Clear Cache");
+
         JPanel controlPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
         controlPanel.add(recurseCheckbox);
         controlPanel.add(Box.createHorizontalStrut(15));
@@ -103,6 +127,7 @@ public class VideoDuplicateFinder extends JFrame {
         controlPanel.add(matchModeCombo);
         controlPanel.add(Box.createHorizontalStrut(15));
         controlPanel.add(scanButton);
+        controlPanel.add(clearCacheButton);
 
         JPanel ffprobePanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
         ffprobePanel.add(new JLabel("FFprobe path:"));
@@ -187,6 +212,17 @@ public class VideoDuplicateFinder extends JFrame {
         addFolderButton.addActionListener(e -> addFolder());
         removeFolderButton.addActionListener(e -> removeFolder());
         scanButton.addActionListener(e -> startScan());
+        clearCacheButton.addActionListener(e -> {
+            int confirm = JOptionPane.showConfirmDialog(this,
+                "Clear the identification cache (" + fingerprintCache.size() + " entries)?\n" +
+                "The next scan will need to re-probe and re-hash every file.",
+                "Clear Cache", JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE);
+            if (confirm == JOptionPane.YES_OPTION) {
+                fingerprintCache.clear();
+                saveHashCache();
+                statusLabel.setText("Cache cleared.");
+            }
+        });
 
         resultsTable.addMouseListener(new MouseAdapter() {
             public void mouseClicked(MouseEvent e) {
@@ -205,6 +241,12 @@ public class VideoDuplicateFinder extends JFrame {
         });
 
         loadFolders();
+        loadHashCache();
+        addWindowListener(new WindowAdapter() {
+            public void windowClosing(WindowEvent e) {
+                saveHashCache();
+            }
+        });
     }
 
     private void addFolder() {
@@ -247,6 +289,64 @@ public class VideoDuplicateFinder extends JFrame {
                 pw.println(folderListModel.get(i));
             }
         } catch (IOException ignored) {}
+    }
+
+    /**
+     * Loads the per-file identification cache (duration + perceptual hash) from disk.
+     * Entries are keyed by absolute path and are considered valid only while a file's
+     * size and last-modified time still match what was recorded -- see CacheEntry.matches().
+     */
+    private static void loadHashCache() {
+        if (!Files.exists(CACHE_FILE)) return;
+        try {
+            for (String line : Files.readAllLines(CACHE_FILE)) {
+                if (line.isEmpty() || line.startsWith("#")) continue;
+                String[] parts = line.split("\t", -1);
+                if (parts.length < 5) continue;
+                try {
+                    String path = parts[0];
+                    long size = Long.parseLong(parts[1]);
+                    long mtime = Long.parseLong(parts[2]);
+                    double duration = Double.parseDouble(parts[3]);
+                    long[] hashes = null;
+                    if (!parts[4].isEmpty()) {
+                        String[] hParts = parts[4].split(",");
+                        hashes = new long[hParts.length];
+                        for (int i = 0; i < hParts.length; i++) hashes[i] = Long.parseLong(hParts[i]);
+                    }
+                    fingerprintCache.put(path, new CacheEntry(size, mtime, duration, hashes));
+                } catch (NumberFormatException ignored) {
+                    // skip malformed line -- cache will just be rebuilt for this entry
+                }
+            }
+        } catch (IOException ignored) {
+            // cache unavailable this run; will rebuild as files are scanned
+        }
+    }
+
+    /** Persists the current in-memory identification cache to disk (one line per file). */
+    private static synchronized void saveHashCache() {
+        try {
+            Files.createDirectories(CACHE_FILE.getParent());
+            try (BufferedWriter w = Files.newBufferedWriter(CACHE_FILE)) {
+                w.write("# VideoDuplicateFinder identification cache -- safe to delete to force re-verification");
+                w.newLine();
+                for (Map.Entry<String, CacheEntry> e : fingerprintCache.entrySet()) {
+                    CacheEntry c = e.getValue();
+                    StringBuilder hashStr = new StringBuilder();
+                    if (c.hashes != null) {
+                        for (int i = 0; i < c.hashes.length; i++) {
+                            if (i > 0) hashStr.append(',');
+                            hashStr.append(c.hashes[i]);
+                        }
+                    }
+                    w.write(e.getKey() + "\t" + c.size + "\t" + c.mtime + "\t" + c.duration + "\t" + hashStr);
+                    w.newLine();
+                }
+            }
+        } catch (IOException ignored) {
+            // best-effort; a failed save just means next run starts from an older cache
+        }
     }
 
     private void updateOptionPanels(JPanel ffprobePanel, JPanel hashPanel) {
@@ -461,7 +561,16 @@ public class VideoDuplicateFinder extends JFrame {
             }
 
             private long[] computeVideoFingerprint(File file, String ffmpegPath, String ffprobePath) {
-                double duration = getVideoDuration(file, ffprobePath);
+                String path = file.getAbsolutePath();
+                long size = file.length();
+                long mtime = file.lastModified();
+
+                CacheEntry cached = fingerprintCache.get(path);
+                if (cached != null && cached.matches(size, mtime) && cached.hashes != null) {
+                    return cached.hashes; // full cache hit -- skip ffprobe and ffmpeg entirely
+                }
+
+                double duration = getVideoDuration(file, ffprobePath); // itself cache-aware
                 if (duration <= 0) return null;
                 long[] hashes = new long[SAMPLE_FRACTIONS.length];
                 for (int i = 0; i < SAMPLE_FRACTIONS.length; i++) {
@@ -471,6 +580,7 @@ public class VideoDuplicateFinder extends JFrame {
                     if (frame == null) return null;
                     hashes[i] = perceptualHash(frame);
                 }
+                fingerprintCache.put(path, new CacheEntry(size, mtime, duration, hashes));
                 return hashes;
             }
 
@@ -529,6 +639,7 @@ public class VideoDuplicateFinder extends JFrame {
                 }
                 progressBar.setVisible(false);
                 scanButton.setEnabled(true);
+                saveHashCache();
             }
         }.execute();
     }
@@ -555,6 +666,7 @@ public class VideoDuplicateFinder extends JFrame {
             String path = (String) tableModel.getValueAt(row, 6);
             File file = new File(path);
             if (file.delete()) {
+                fingerprintCache.remove(file.getAbsolutePath());
                 tableModel.removeRow(row);
                 deleted++;
             } else {
@@ -583,7 +695,32 @@ public class VideoDuplicateFinder extends JFrame {
         return String.format("%d:%02d", m, s);
     }
 
+    /**
+     * Returns a file's duration, reusing the cached value when the file's size and
+     * modified-time haven't changed since it was last probed. Falls back to ffprobe
+     * on a cache miss (new file, or a file whose size/mtime changed) and updates the
+     * cache -- discarding any stale hash fingerprint, since it was computed against
+     * the file's previous contents.
+     */
     private static double getVideoDuration(File file, String ffprobePath) {
+        String path = file.getAbsolutePath();
+        long size = file.length();
+        long mtime = file.lastModified();
+
+        CacheEntry cached = fingerprintCache.get(path);
+        if (cached != null && cached.matches(size, mtime)) {
+            return cached.duration;
+        }
+
+        double duration = probeVideoDuration(file, ffprobePath);
+        if (duration >= 0) {
+            fingerprintCache.put(path, new CacheEntry(size, mtime, duration, null));
+        }
+        return duration;
+    }
+
+    /** Runs ffprobe to extract the precise duration of a video file in seconds (uncached). */
+    private static double probeVideoDuration(File file, String ffprobePath) {
         try {
             ProcessBuilder pb = new ProcessBuilder(
                 ffprobePath,
